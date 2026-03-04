@@ -70,6 +70,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     void* arg_weights_out_ptr = reinterpret_cast<void*>(args[ARG_PTR_WEIGHTS_OUT]);
     void* arg_weights_norm_ptr = reinterpret_cast<void*>(args[ARG_PTR_WEIGHTS_NORM]);
 
+    const float epsilon = 1e-5f;
+
     // External tensors
     uint64_t x_shapes[2] = {192, 128};
     Tensor ext_x = make_tensor_external(arg_x_ptr, x_shapes, 2, DataType::FLOAT32);

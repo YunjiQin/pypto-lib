@@ -87,10 +87,12 @@ InstallPtoasWheel() {
 
     echo "Fetching latest release assets from huawei-csl/PTOAS..."
     local assets
-    if command -v gh >/dev/null 2>&1; then
-        assets="$(gh release view --repo huawei-csl/PTOAS --json assets -q '.assets[].name')"
-    else
-        assets="$(curl -sL https://api.github.com/repos/huawei-csl/PTOAS/releases/latest \
+    assets="$(gh release view --repo huawei-csl/PTOAS --json assets -q '.assets[].name' 2>/dev/null)" || true
+    if [ -z "$assets" ] && command -v gh >/dev/null 2>&1; then
+        echo "gh failed or needs GH_TOKEN, using curl..."
+    fi
+    if [ -z "$assets" ]; then
+        assets="$(curl --http1.1 -sL https://api.github.com/repos/huawei-csl/PTOAS/releases/latest \
                   | python3 -c "import sys,json; [print(a['name']) for a in json.load(sys.stdin).get('assets',[])]")"
     fi
 
@@ -122,13 +124,14 @@ InstallPtoasWheel() {
     local tmp_dir
     tmp_dir="$(mktemp -d)"
 
-    if command -v gh >/dev/null 2>&1; then
-        gh release download --repo huawei-csl/PTOAS -p "$match" -D "$tmp_dir"
+    if command -v gh >/dev/null 2>&1 && gh release download --repo huawei-csl/PTOAS -p "$match" -D "$tmp_dir" 2>/dev/null; then
+        :
     else
         local dl_url
-        dl_url="$(curl -sL https://api.github.com/repos/huawei-csl/PTOAS/releases/latest \
+        dl_url="$(curl --http1.1 -sL https://api.github.com/repos/huawei-csl/PTOAS/releases/latest \
                   | python3 -c "import sys,json; assets=json.load(sys.stdin).get('assets',[]); [print(a['browser_download_url']) for a in assets if a['name']=='$match']")"
-        curl -L -o "$tmp_dir/$match" "$dl_url"
+        echo "Downloading $match via curl (HTTP/1.1 to avoid framing issues)..."
+        curl --http1.1 -L -o "$tmp_dir/$match" "$dl_url"
     fi
 
     echo "Installing $match..."
