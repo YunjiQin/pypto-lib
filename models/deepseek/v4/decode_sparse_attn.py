@@ -51,9 +51,13 @@ VALID_TOKEN_TILE = 16
 # (a multiple of ATTN_K_TILE); 128 rows x HEAD_DIM bf16 = 128 KB UB (well under
 # the 192 KB Vec budget).
 GATHER_FILL_TILE = 128
-ROPE_TOKEN_TILE = 2
-ROPE_PACK_TOKEN_TILE = 32
-ROPE_PACK_GROUP_TILE = 1
+# Inverse-RoPE is head-parallel; split each head's T tokens into ROPE_OUT_TILES
+# tiles so the task count (H * ROPE_OUT_TILES) fills the 48 AIV cores with a
+# smaller wave tail than one-task-per-head (H=64 on 48 cores = 2 waves, 16-task
+# tail). H and T are powers of two while 48 = 16*3, so no clean tiling divides
+# the core count evenly -- finer tiles only shrink the residual tail.
+ROPE_OUT_TILES = 2
+ROPE_OUT_TOK_TILE = T // ROPE_OUT_TILES
 H_TILE = 16
 # Largest sparse-K tile that fits the cube Mat buffer and divides TOPK with no
 # padding (WIN and IDX_TOPK are multiples of 128).
@@ -76,7 +80,7 @@ NEG_INF = -1.0e20
 # leaving rows uninitialized on the NPU (the spmd block counts and the
 # strided/bulk loops below all assume exact divisibility).
 assert T % VALID_TOKEN_TILE == 0, f"T ({T}) must be divisible by VALID_TOKEN_TILE ({VALID_TOKEN_TILE})"  # build_valid
-assert T % ROPE_TOKEN_TILE == 0, f"T ({T}) must be divisible by ROPE_TOKEN_TILE ({ROPE_TOKEN_TILE})"      # rope
+assert T % ROPE_OUT_TILES == 0, f"T ({T}) must be divisible by ROPE_OUT_TILES ({ROPE_OUT_TILES})"      # rope
 assert T % QUANT_TOKEN_TILE == 0, f"T ({T}) must be divisible by QUANT_TOKEN_TILE ({QUANT_TOKEN_TILE})"   # quant
 assert H % O_GROUPS == 0, f"H ({H}) must be divisible by O_GROUPS ({O_GROUPS})"                           # rope_pack / o_packed grouping
 assert (O_GROUPS * O_LORA) % B_K_TILE == 0, \
@@ -297,62 +301,70 @@ def sparse_attn(
                 n_col = n_hh * HEAD_DIM
                 o_packed[n_pack_row : n_pack_row + 1, n_col : n_col + NOPE_DIM] = n_out[n_hi : n_hi + 1, 0 : NOPE_DIM]
 
-    # Inverse RoPE: gather even/odd lanes, rotate, then mask-scatter back to
-    # interleaved layout. The BF16 round-trip on rotated values matches golden.
-    rope_buf = pl.create_tensor([T * H, ROPE_DIM], dtype=pl.BF16)
-    for r_idx in pl.spmd(T // ROPE_TOKEN_TILE, name_hint="rope"):
-        r_t0 = r_idx * ROPE_TOKEN_TILE
-        # A3 interleaved swap-gather, built ENTIRELY IN-KERNEL, replacing the de-interleave
-        # gather + rotate + re-interleave scatter. Sparse uses the CONJUGATE (inverse)
-        # rotation -- out[2k]=x[2k]cos+x[2k+1]sin, out[2k+1]=x[2k+1]cos-x[2k]sin -- so its
-        # sign is [+1,-1,...] (OPPOSITE of the forward q/kv/compressor sign). swap_idx (j^1),
-        # sign and dup_idx (j>>1) come from pl.arange (column pattern is chunk-independent,
-        # so build once per task); cos_il/sin_il are dup-gathered per chunk from freqs_cos/sin
-        # (cast BF16->FP32, broadcast across H rows). The golden BF16 round-trip is preserved.
-        #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]
-        sp_ones = pl.full([H, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0)
-        sp_col = pl.col_expand_mul(sp_ones, pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
-        sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
-        sp_dup_idx = pl.cast(sp_dup_f, target_type=pl.INT32)                                      # j>>1
-        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
-        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
-        sp_sign = pl.neg(pl.sub(pl.mul(sp_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate = -fwd)
-        for r_dt in pl.range(ROPE_TOKEN_TILE):
-            r_t = r_t0 + r_dt
-            r_row = r_t * H
+    # Precompute the head-INVARIANT interleaved cos and sign*sin once. cos_il[j],
+    # sin_il[j] and sign[j]=[+1,-1,...] depend only on (token, column), not head,
+    # so building them per head (as the head-parallel rope below would) repeats
+    # the same dup-gather H times on the bottleneck Vec engine. This pre-pass
+    # reads only freqs_cos/sin (no attention dependency), so the scheduler floats
+    # it ahead and overlaps it with the attention compute -- off the critical
+    # path. sign is folded into sin (exact: multiply by +/-1) so rope does one
+    # fewer multiply. The CONJUGATE (inverse) rotation is:
+    #   out[j] = x[j]*cos_il[j] + x[j^1]*sign[j]*sin_il[j]
+    rope_cos_il = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    rope_sin_signed = pl.create_tensor([T, ROPE_DIM], dtype=pl.FP32)
+    for cp in pl.spmd(HALF_ROPE // ROPE_TILE, name_hint="rope_cs"):
+        cp_r0 = cp * ROPE_TILE
+        cp_c0 = 2 * cp_r0
+        cs_col = pl.col_expand_mul(
+            pl.full([T, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+        cs_dup_f = pl.cast(pl.cast(pl.mul(cs_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        cs_dup_idx = pl.cast(cs_dup_f, target_type=pl.INT32)                                      # j>>1
+        cs_lane = pl.sub(cs_col, pl.mul(cs_dup_f, 2.0))                                           # j%2
+        cs_sign = pl.neg(pl.sub(pl.mul(cs_lane, 2.0), 1.0))                                       # [+1,-1,...] (conjugate)
+        cs_cos = pl.cast(freqs_cos[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+        cs_sin = pl.cast(freqs_sin[0:T, cp_r0 : cp_r0 + ROPE_TILE], target_type=pl.FP32)
+        rope_cos_il[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.gather(cs_cos, dim=-1, index=cs_dup_idx)
+        rope_sin_signed[0:T, cp_c0 : cp_c0 + ROPE_INTERLEAVE_TILE] = pl.mul(
+            pl.gather(cs_sin, dim=-1, index=cs_dup_idx), cs_sign)
 
-            for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
-                c0 = 2 * r_r0
-                # gather requires FP/INT (not BF16): cast BF16 tile to FP32 first.
-                r_tile_fp32 = pl.cast(attn_rope_stage[r_row : r_row + H, c0 : c0 + ROPE_INTERLEAVE_TILE], target_type=pl.FP32)
-                r_cos = pl.cast(freqs_cos[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
-                r_sin = pl.cast(freqs_sin[r_t : r_t + 1, r_r0 : r_r0 + ROPE_TILE], target_type=pl.FP32)
-                r_cos_h = pl.col_expand_mul(pl.full([H, ROPE_TILE], dtype=pl.FP32, value=1.0), r_cos)
-                r_sin_h = pl.col_expand_mul(pl.full([H, ROPE_TILE], dtype=pl.FP32, value=1.0), r_sin)
-                r_cos_il = pl.gather(r_cos_h, dim=-1, index=sp_dup_idx)
-                r_sin_il = pl.gather(r_sin_h, dim=-1, index=sp_dup_idx)
-                r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
-                r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(pl.mul(r_swapped, sp_sign), r_sin_il))
-                # Store the BF16-rounded rotated values directly (golden also
-                # rounds inverse-RoPE to bf16): rope_buf is BF16, halving its GM
-                # round-trip and dropping the rope_pack down-cast below.
-                r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
-                rope_buf[r_row : r_row + H, c0 : c0 + ROPE_INTERLEAVE_TILE] = r_rot
-
-    # Pack the per-head inverse-RoPE results into o_packed's strided rope
-    # columns. For a fixed (group, head) the rope segment lands at the SAME 64
-    # columns for every token, so o_packed[g*T : g*T+T, col:col+ROPE_DIM] is a
-    # single [T, ROPE_DIM] tile -- write all T tokens of a head in one strided
-    # MTE store instead of T separate [1, ROPE_DIM] (128 B) dup-stores (Vec was
-    # ~0.5%). rope_buf_3d[:, gh, :] gathers that head's rope rows (stride H)
-    # across tokens; the values are bit-identical to the per-token scatter.
-    rope_buf_3d = pl.reshape(rope_buf, [T, H, ROPE_DIM])
-    for rp_gh in pl.spmd(H, name_hint="rope_pack"):
+    # Inverse RoPE fused with the rope-column pack: one task per head rotates
+    # that head's rope segment for all T tokens and stores it STRAIGHT into
+    # o_packed's strided rope columns -- dropping the separate rope_pack stage
+    # and the rope_buf GM round-trip. cos_il / sign*sin come from the pre-pass
+    # above (just loaded, not re-gathered); only swap_idx (j^1, applied to this
+    # head's data) is rebuilt per task -- cheap arange, no big-tile gather.
+    attn_rope_stage_3d = pl.reshape(attn_rope_stage, [T, H, ROPE_DIM])
+    for rp_idx in pl.spmd(H * ROPE_OUT_TILES, name_hint="rope"):
+        rp_gh = rp_idx // ROPE_OUT_TILES
+        rp_tt = rp_idx - rp_gh * ROPE_OUT_TILES
+        rp_t0 = rp_tt * ROPE_OUT_TOK_TILE
         rp_g = rp_gh // HEADS_PER_GROUP
         rp_hh = rp_gh - rp_g * HEADS_PER_GROUP
-        rp_rope_tile = pl.reshape(rope_buf_3d[0:T, rp_gh : rp_gh + 1, 0:ROPE_DIM], [T, ROPE_DIM])
         rp_col = rp_hh * HEAD_DIM + NOPE_DIM
-        o_packed[rp_g * T : rp_g * T + T, rp_col : rp_col + ROPE_DIM] = rp_rope_tile
+        rp_o0 = rp_g * T + rp_t0
+        sp_col = pl.col_expand_mul(
+            pl.full([ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE], dtype=pl.FP32, value=1.0),
+            pl.cast(pl.arange(0, [1, ROPE_INTERLEAVE_TILE], dtype=pl.INT32), target_type=pl.FP32))
+        sp_dup_f = pl.cast(pl.cast(pl.mul(sp_col, 0.5), target_type=pl.INT32, mode="trunc"), target_type=pl.FP32)
+        sp_lane = pl.sub(sp_col, pl.mul(sp_dup_f, 2.0))                                           # j%2
+        sp_swap_idx = pl.cast(pl.sub(pl.add(sp_col, 1.0), pl.mul(sp_lane, 2.0)), target_type=pl.INT32)  # j^1
+
+        for r_r0 in pl.range(0, HALF_ROPE, ROPE_TILE):
+            c0 = 2 * r_r0
+            # This head's rope rows for this token tile (stride H); gather needs
+            # FP/INT, so cast the strided BF16 slice to FP32 first.
+            r_tile_fp32 = pl.cast(
+                pl.reshape(attn_rope_stage_3d[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, rp_gh : rp_gh + 1, c0 : c0 + ROPE_INTERLEAVE_TILE], [ROPE_OUT_TOK_TILE, ROPE_INTERLEAVE_TILE]),
+                target_type=pl.FP32)
+            r_cos_il = rope_cos_il[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
+            r_sin_signed = rope_sin_signed[rp_t0 : rp_t0 + ROPE_OUT_TOK_TILE, c0 : c0 + ROPE_INTERLEAVE_TILE]
+            r_swapped = pl.gather(r_tile_fp32, dim=-1, index=sp_swap_idx)
+            r_rot = pl.add(pl.mul(r_tile_fp32, r_cos_il), pl.mul(r_swapped, r_sin_signed))
+            # Store BF16-rounded rotated values straight into o_packed's rope
+            # columns for this head (golden also rounds inverse-RoPE to bf16).
+            r_rot = pl.cast(r_rot, target_type=pl.BF16, mode="rint")
+            o_packed[rp_o0 : rp_o0 + ROPE_OUT_TOK_TILE, rp_col + c0 : rp_col + c0 + ROPE_INTERLEAVE_TILE] = r_rot
 
     # Grouped BF16 projection `o_packed @ wo_a^T` -> `o_r`. Vec post-process
     # (BF16 store + per-row partial amax) is T-tiled inside the scope as a
@@ -776,6 +788,9 @@ if __name__ == "__main__":
                         help="Place a compressed raw index inside the window prefix order.")
     parser.add_argument("--golden-data", type=str, default=None)
     parser.add_argument("--enable-l2-swimlane", action="store_true", default=False)
+    parser.add_argument("--enable-dep-gen", action="store_true", default=False,
+                        help="Capture PTO2 dependency edges (deps.json); the swimlane "
+                             "converter draws fanout/fanin arrows from the sibling file.")
     parser.add_argument("--enable-pmu", nargs="?", const=2, default=0, type=int, choices=[0, 1, 2, 4])
     args = parser.parse_args()
 
@@ -798,6 +813,7 @@ if __name__ == "__main__":
             platform=args.platform,
             device_id=args.device,
             enable_l2_swimlane=args.enable_l2_swimlane,
+            enable_dep_gen=args.enable_dep_gen,
             enable_pmu=args.enable_pmu,
         ),
         rtol=1e-3,
