@@ -95,7 +95,12 @@ HCA_CASES = (
     "hetero_full_capacity_overlay_cmp",
     "hetero_single_long_mix_overlay_cmp",
     "cmp_sparse_lens_boundary",
+    "cmp_sparse_lens_zero_garbage",
     "issue511_state_slot_boundary",
+    "hetero_second_only",
+    "issue511_active_no_write_slot",
+    "issue511_ori_block_table_permutation",
+    "issue511_cmp_block_table_permutation",
 )
 
 HCA_KV_STORE_TILE = 16
@@ -142,8 +147,8 @@ def _prefill_hca_cache_writeback_overlay(
     return pl.reshape(ori_kv_flat, [HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM])
 
 
-@pl.jit
-def prefill_attention_hca(
+@pl.jit.inline
+def prefill_attention_hca_core(
     x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
@@ -275,6 +280,88 @@ def prefill_attention_hca(
         post,
         comb,
         x_out,
+    )
+    return x_out
+
+
+@pl.jit
+def prefill_attention_hca(
+    x_hc: pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16],
+    hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
+    hc_attn_scale: pl.Tensor[[3], pl.FP32],
+    hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
+    wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
+    wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
+    wkv: pl.Tensor[[D, HEAD_DIM], pl.BF16],
+    gamma_cq: pl.Tensor[[Q_LORA], pl.BF16],
+    gamma_ckv: pl.Tensor[[HEAD_DIM], pl.BF16],
+    freqs_cos: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    freqs_sin: pl.Tensor[[MAX_SEQ_LEN, ROPE_HEAD_DIM], pl.BF16],
+    cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
+    cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    cmp_kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
+    cmp_score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
+    compress_state_block_table: pl.Tensor[[MAX_REQS, HCA_STATE_MAX_BLOCKS], pl.INT32],
+    kv_cache: pl.Tensor[[HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16],
+    ori_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    ori_block_table: pl.Tensor[[MAX_REQS, SPARSE_ORI_MAX_BLOCKS], pl.INT32],
+    cmp_kv: pl.Out[pl.Tensor[[HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM], pl.BF16]],
+    cmp_block_table: pl.Tensor[[MAX_REQS, SPARSE_CMP_MAX_BLOCKS], pl.INT32],
+    cmp_sparse_indices: pl.Tensor[[MAX_TOKENS, SPARSE_TOPK], pl.INT32],
+    cmp_sparse_lens: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    token_to_request: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    position_ids: pl.Tensor[[MAX_TOKENS], pl.INT32],
+    cmp_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    state_slot_mapping: pl.Tensor[[MAX_TOKENS], pl.INT64],
+    attn_sink: pl.Tensor[[H], pl.FP32],
+    wo_a: pl.Tensor[[O_GROUPS, O_LORA, O_GROUP_IN], pl.BF16],
+    wo_b: pl.Tensor[[D, O_GROUPS * O_LORA], pl.INT8],
+    wo_b_scale: pl.Tensor[[D], pl.FP32],
+    x_out: pl.Out[pl.Tensor[[MAX_TOKENS, HC_MULT, D], pl.BF16]],
+    num_tokens: pl.Scalar[pl.INT32],
+):
+    x_out = prefill_attention_hca_core(
+        x_hc,
+        hc_attn_fn,
+        hc_attn_scale,
+        hc_attn_base,
+        attn_norm_w,
+        wq_a,
+        wq_b,
+        wq_b_scale,
+        wkv,
+        gamma_cq,
+        gamma_ckv,
+        freqs_cos,
+        freqs_sin,
+        cmp_wkv,
+        cmp_wgate,
+        cmp_ape,
+        cmp_norm_w,
+        cmp_kv_state,
+        cmp_score_state,
+        compress_state_block_table,
+        kv_cache,
+        ori_slot_mapping,
+        ori_block_table,
+        cmp_kv,
+        cmp_block_table,
+        cmp_sparse_indices,
+        cmp_sparse_lens,
+        token_to_request,
+        position_ids,
+        cmp_slot_mapping,
+        state_slot_mapping,
+        attn_sink,
+        wo_a,
+        wo_b,
+        wo_b_scale,
+        x_out,
+        num_tokens,
     )
     return x_out
 
@@ -482,9 +569,24 @@ def _resolve_hca_case(
     elif hca_case == "cmp_sparse_lens_boundary":
         q_lens_values = [50, 0]
         context_lens_values = [100, 0]
+    elif hca_case == "cmp_sparse_lens_zero_garbage":
+        q_lens_values = [50, 0]
+        context_lens_values = [100, 0]
     elif hca_case == "issue511_state_slot_boundary":
         q_lens_values = [2, 2]
         context_lens_values = [126, 254]
+    elif hca_case == "hetero_second_only":
+        q_lens_values = [0, 17]
+        context_lens_values = [0, 100]
+    elif hca_case == "issue511_active_no_write_slot":
+        q_lens_values = [32, 0]
+        context_lens_values = [96, 0]
+    elif hca_case == "issue511_ori_block_table_permutation":
+        q_lens_values = [32, 32]
+        context_lens_values = [64, 120]
+    elif hca_case == "issue511_cmp_block_table_permutation":
+        q_lens_values = [50, 40]
+        context_lens_values = [128, 256]
     else:
         raise ValueError(f"unknown --hca-case {hca_case!r}; expected one of {HCA_CASES}")
 
@@ -678,43 +780,65 @@ def build_tensor_specs(
                 if row >= 0:
                     flat[row] = seeded_uniform((MAIN_OUT_DIM,), 13000 + req * 65536 + abs_pos, 0.05)
         return state
+    def cache_row_from_table(table, req, slot):
+        block = slot // BLOCK_SIZE
+        intra = slot % BLOCK_SIZE
+        phys_block = int(table[req, block].item())
+        if phys_block < 0:
+            return -1
+        return phys_block * BLOCK_SIZE + intra
     def init_kv_cache():
         cache = torch.zeros(HCA_ORI_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(HCA_ORI_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        table = init_ori_block_table()
         for req, ctx in enumerate(context_lens_values):
             if ctx > 0:
                 prefix_start = max(0, ctx - WIN)
                 prefix = seeded_uniform((ctx, HEAD_DIM), 11 + req, 0.1).to(torch.bfloat16)
                 for pos_i in range(prefix_start, ctx):
-                    cache_flat[req * BLOCK_SIZE + pos_i % WIN] = prefix[pos_i]
+                    row = cache_row_from_table(table, req, pos_i % WIN)
+                    if row >= 0:
+                        cache_flat[row] = prefix[pos_i]
         return cache
     def init_ori_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
         token_to_req, local_pos, _ = token_meta()
+        table = init_ori_block_table()
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
             logical_pos = context_lens_values[req] + int(local_pos[t].item())
-            mapping[t] = req * BLOCK_SIZE + logical_pos % WIN
+            mapping[t] = cache_row_from_table(table, req, logical_pos % WIN)
+        if hca_case == "issue511_active_no_write_slot":
+            mapping[num_tokens - 1] = -1
         return mapping
     def init_ori_block_table():
         table = torch.full((MAX_REQS, SPARSE_ORI_MAX_BLOCKS), -1, dtype=torch.int32)
         for b in range(MAX_REQS):
-            table[b, 0] = b
+            phys = b
+            if hca_case == "issue511_ori_block_table_permutation":
+                phys = (b + 1) % MAX_REQS
+            table[b, 0] = phys
         return table
     def init_cmp_kv():
         cache = torch.zeros(HCA_CMP_BLOCK_NUM, BLOCK_SIZE, 1, HEAD_DIM)
         cache_flat = cache.view(HCA_CMP_BLOCK_NUM * BLOCK_SIZE, HEAD_DIM)
+        table = init_cmp_block_table()
         for req, ctx in enumerate(context_lens_values):
             completed = ctx // COMPRESS_RATIO
             if completed > 0:
                 prefix_cmp = seeded_uniform((completed, HEAD_DIM), 14 + req, 0.1).to(torch.bfloat16)
                 for cmp_slot in range(completed):
-                    cache_flat[req * BLOCK_SIZE + cmp_slot] = prefix_cmp[cmp_slot]
+                    row = cache_row_from_table(table, req, cmp_slot)
+                    if row >= 0:
+                        cache_flat[row] = prefix_cmp[cmp_slot]
         return cache
     def init_cmp_block_table():
         table = torch.full((MAX_REQS, SPARSE_CMP_MAX_BLOCKS), -1, dtype=torch.int32)
         for b in range(MAX_REQS):
-            table[b, 0] = b
+            phys = b
+            if hca_case == "issue511_cmp_block_table_permutation":
+                phys = (b + 1) % MAX_REQS
+            table[b, 0] = phys
         return table
     def init_cmp_sparse_indices():
         topk_idxs = torch.full((MAX_TOKENS, SPARSE_TOPK), -1, dtype=torch.int32)
@@ -746,6 +870,10 @@ def build_tensor_specs(
             valid = (topk_idxs[t] >= 0).nonzero()
             if valid.numel():
                 sparse_lens[t] = int(valid[-1].item()) + 1
+        if hca_case == "cmp_sparse_lens_zero_garbage":
+            for t in range(0, num_tokens, 7):
+                topk_idxs[t, :] = torch.arange(SPARSE_TOPK, dtype=torch.int32) + WIN + MAX_TOKENS + 1024
+                sparse_lens[t] = 0
         validate_overlay_topk(topk_idxs, token_to_req, pos, sparse_lens)
         return topk_idxs
     def init_cmp_sparse_lens():
@@ -757,6 +885,8 @@ def build_tensor_specs(
                 lens[t] = int(valid[-1].item()) + 1
                 if hca_case == "cmp_sparse_lens_boundary":
                     lens[t] = max(1, int(lens[t].item()) - 8)
+                elif hca_case == "cmp_sparse_lens_zero_garbage" and t % 7 == 0:
+                    lens[t] = 0
         return lens
     def init_token_to_request():
         return token_meta()[0]
@@ -764,8 +894,13 @@ def build_tensor_specs(
         return token_meta()[2]
     def init_cmp_slot_mapping():
         out = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
-        for req, token_id, cmp_slot in cmp_write_records():
-            out[token_id] = req * BLOCK_SIZE + cmp_slot
+        table = init_cmp_block_table()
+        records = cmp_write_records()
+        for req, token_id, cmp_slot in records:
+            out[token_id] = cache_row_from_table(table, req, cmp_slot)
+        if hca_case == "issue511_active_no_write_slot" and records:
+            _, token_id, _ = records[0]
+            out[token_id] = -1
         return out
     def init_state_slot_mapping():
         mapping = torch.full((MAX_TOKENS,), -1, dtype=torch.int64)
@@ -773,6 +908,8 @@ def build_tensor_specs(
         for t in range(num_tokens):
             req = int(token_to_req[t].item())
             mapping[t] = state_row(req, int(pos[t].item()))
+        if hca_case == "issue511_active_no_write_slot":
+            mapping[num_tokens - 1] = -1
         return mapping
     def init_attn_sink():
         return torch.zeros(H)
@@ -1002,7 +1139,7 @@ if __name__ == "__main__":
         ),
         rtol=1e-2,
         atol=1e-2,
-        compile_only=args.compile_only or args.platform.endswith("sim"),
+        compile_only=args.compile_only,
         compare_fn={
             "x_out": active_x_out_compare(compare_tokens),
         },
