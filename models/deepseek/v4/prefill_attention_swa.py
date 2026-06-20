@@ -94,7 +94,7 @@ def prefill_attention_swa(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -221,7 +221,7 @@ def prefill_attention_swa_test(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -394,10 +394,6 @@ def build_tensor_specs(
     if max_position > MAX_SEQ_LEN:
         raise ValueError(f"position_ids exceed MAX_SEQ_LEN={MAX_SEQ_LEN}: got {max_position}")
 
-    def seeded_uniform(shape, seed, scale=1.0):
-        return (torch.rand(*shape) - 0.5) * scale
-    def seeded_normal(shape, seed, std=1.0):
-        return torch.randn(*shape) * std
 
     def token_pos():
         # Single-request absolute positions: pos[t] = context_len + local_idx
@@ -447,7 +443,7 @@ def build_tensor_specs(
                 seen_abs.add(key_abs)
 
     def init_x_hc():
-        x = seeded_normal((T, HC_MULT, D), 1, 0.05)
+        x = torch.empty(T, HC_MULT, D).uniform_(-1, 1)
         x[num_tokens:] = 0
         return x
     # Real layer-0 (SWA) hc_attn scale/base (fn synthetic at real magnitude). A synthetic
@@ -455,7 +451,7 @@ def build_tensor_specs(
     # hc residual to near-zero in x_out where quant noise blows up the relative tail. Mirrors
     # decode_attention_swa.
     def init_hc_attn_fn():
-        return seeded_normal((MIX_HC, HC_DIM), 2, 0.039)
+        return torch.randn(MIX_HC, HC_DIM) * 0.039
     def init_hc_attn_scale():
         return torch.tensor([2.076026, 0.018729, 0.245936])
     def init_hc_attn_base():
@@ -470,11 +466,11 @@ def build_tensor_specs(
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
-        return seeded_uniform((D, Q_LORA), 3, D ** -0.5)
+        return (torch.rand(D, Q_LORA) - 0.5) * D ** -0.5
     def init_wq_b():
-        return seeded_uniform((Q_LORA, H * HEAD_DIM), 4, Q_LORA ** -0.5)
+        return (torch.rand(Q_LORA, H * HEAD_DIM) - 0.5) * Q_LORA ** -0.5
     def init_wkv():
-        return seeded_uniform((D, HEAD_DIM), 5, D ** -0.5)
+        return (torch.rand(D, HEAD_DIM) - 0.5) * D ** -0.5
     def init_gamma_cq():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
@@ -502,7 +498,7 @@ def build_tensor_specs(
         start = max(0, context_len - WIN)
         for abs_pos in range(start, context_len):
             row = cache_row_from_table(table, abs_pos % WIN)
-            value = seeded_uniform((HEAD_DIM,), 11 + abs_pos, 0.1)
+            value = (torch.rand(HEAD_DIM,) - 0.5) * 0.1
             if row >= 0:
                 cache_flat[row] = value.to(torch.bfloat16)
         return cache
@@ -548,9 +544,9 @@ def build_tensor_specs(
     def init_attn_sink():
         return torch.zeros(H)
     def init_wo_a():
-        return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 9, O_GROUP_IN ** -0.5)
+        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5
     def init_wo_b():
-        return seeded_uniform((D, O_GROUPS * O_LORA), 10, (O_GROUPS * O_LORA) ** -0.5)
+        return (torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
@@ -562,7 +558,7 @@ def build_tensor_specs(
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
-        TensorSpec("attn_norm_w", [D], torch.float32, init_value=init_attn_norm_w),
+        TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=init_attn_norm_w),
         TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),

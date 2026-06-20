@@ -80,7 +80,7 @@ def indexer(
     inner_wkv: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.FP32],
+    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Tensor[[B, S, SCORE_LEN], pl.FP32],
@@ -310,7 +310,7 @@ def indexer_test(
     inner_wkv: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_wgate: pl.Tensor[[D, INNER_OUT_DIM], pl.BF16],
     inner_ape: pl.Tensor[[COMPRESS_RATIO, INNER_OUT_DIM], pl.FP32],
-    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.FP32],
+    inner_norm_w: pl.Tensor[[INNER_HEAD_DIM], pl.BF16],
     idx_kv_cache: pl.Out[pl.Tensor[[IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], pl.BF16]],
     idx_block_table: pl.Tensor[[B, IDX_CACHE_MAX_BLOCKS], pl.INT32],
     score: pl.Out[pl.Tensor[[B, S, SCORE_LEN], pl.FP32]],
@@ -412,7 +412,6 @@ def golden_indexer(tensors):
     sin = tensors["sin"]
     hadamard = tensors["hadamard"].float()
 
-    position_ids = tensors["position_ids"].to(torch.int64)
     kv_seq_lens = tensors["kv_seq_lens"].to(torch.int64)
     offset = int(tensors["offset"])
 
@@ -431,7 +430,7 @@ def golden_indexer(tensors):
 
     q = torch.cat([q[..., :-rd], torch.stack([y0, y1], dim=-1).flatten(-2)], dim=-1)
 
-    q = q @ hadamard
+    q = q.to(torch.bfloat16).float() @ hadamard
     # W8A8C16: q and Indexer Cache are quantized per row to INT8 for score matmul,
     # then dequantized with q_scale * kv_scale.
     # flash: fp4_act_quant on q (FP4 simulation).
@@ -632,7 +631,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("inner_wkv", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wkv),
         TensorSpec("inner_wgate", [D, INNER_OUT_DIM], torch.bfloat16, init_value=init_inner_wgate),
         TensorSpec("inner_ape", [COMPRESS_RATIO, INNER_OUT_DIM], torch.float32, init_value=init_inner_ape),
-        TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.float32, init_value=init_inner_norm_w),
+        TensorSpec("inner_norm_w", [INNER_HEAD_DIM], torch.bfloat16, init_value=init_inner_norm_w),
         TensorSpec("idx_kv_cache", [IDX_CACHE_BLOCK_NUM, BLOCK_SIZE, 1, IDX_HEAD_DIM], torch.bfloat16, init_value=init_idx_kv_cache, is_output=True),
         TensorSpec("idx_block_table", [B, IDX_CACHE_MAX_BLOCKS], torch.int32, init_value=init_idx_block_table),
         # Outputs are fixed to SCORE_LEN; positions past cache_len are -inf for score and -1 for topk_idxs.

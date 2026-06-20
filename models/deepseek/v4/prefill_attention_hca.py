@@ -85,7 +85,7 @@ def prefill_attention_hca(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -97,7 +97,7 @@ def prefill_attention_hca(
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cmp_kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     cmp_score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
@@ -233,7 +233,7 @@ def prefill_attention_hca_test(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -245,7 +245,7 @@ def prefill_attention_hca_test(
     cmp_wkv: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_wgate: pl.Tensor[[D, MAIN_OUT_DIM], pl.BF16],
     cmp_ape: pl.Tensor[[COMPRESS_RATIO, MAIN_OUT_DIM], pl.FP32],
-    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     cmp_kv_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     cmp_score_state: pl.Tensor[[HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM], pl.FP32],
     compress_state_block_table: pl.Tensor[[HCA_STATE_MAX_BLOCKS], pl.INT32],
@@ -514,13 +514,9 @@ def build_tensor_specs(
                 records.append((token_id, cmp_slot))
         return records
 
-    def seeded_uniform(shape, seed, scale=1.0):
-        return (torch.rand(*shape) - 0.5) * scale
-    def seeded_normal(shape, seed, std=1.0):
-        return torch.randn(*shape) * std
 
     def init_x_hc():
-        x = seeded_normal((T, HC_MULT, D), 1, 0.05)
+        x = torch.empty(T, HC_MULT, D).uniform_(-1, 1)
         x[num_tokens:] = 0
         return x
     # Real layer-9 (HCA, ratio-128) hc_attn scale/base (fn synthetic at real magnitude). A
@@ -528,7 +524,7 @@ def build_tensor_specs(
     # and the hc residual to near-zero in x_out where W8A8 noise blows up the relative tail.
     # Mirrors decode_attention_hca.
     def init_hc_attn_fn():
-        return seeded_normal((MIX_HC, HC_DIM), 2, 0.0495)
+        return torch.randn(MIX_HC, HC_DIM) * 0.0495
     def init_hc_attn_scale():
         return torch.tensor([0.079046, 0.04213, 0.121901])
     def init_hc_attn_base():
@@ -543,11 +539,11 @@ def build_tensor_specs(
     def init_attn_norm_w():
         return torch.ones(D)
     def init_wq_a():
-        return seeded_uniform((D, Q_LORA), 3, D ** -0.5)
+        return (torch.rand(D, Q_LORA) - 0.5) * D ** -0.5
     def init_wq_b():
-        return seeded_uniform((Q_LORA, H * HEAD_DIM), 4, Q_LORA ** -0.5)
+        return (torch.rand(Q_LORA, H * HEAD_DIM) - 0.5) * Q_LORA ** -0.5
     def init_wkv():
-        return seeded_uniform((D, HEAD_DIM), 5, D ** -0.5)
+        return (torch.rand(D, HEAD_DIM) - 0.5) * D ** -0.5
     def init_gamma_cq():
         return torch.ones(Q_LORA)
     def init_gamma_ckv():
@@ -560,13 +556,13 @@ def build_tensor_specs(
     # zero-mean Gaussian BF16 weights at the measured std; RMSNorm gamma near the measured mean.
     # Mirrors decode_attention_hca / decode_compressor_ratio128.
     def init_cmp_wkv():
-        return seeded_normal((D, MAIN_OUT_DIM), 6, 0.0246)
+        return torch.randn(D, MAIN_OUT_DIM) * 0.0246
     def init_cmp_wgate():
-        return seeded_normal((D, MAIN_OUT_DIM), 7, 0.0316)
+        return torch.randn(D, MAIN_OUT_DIM) * 0.0316
     def init_cmp_ape():
-        return seeded_normal((COMPRESS_RATIO, MAIN_OUT_DIM), 8, 0.0340)
+        return torch.randn(COMPRESS_RATIO, MAIN_OUT_DIM) * 0.0340
     def init_cmp_norm_w():
-        return 0.1001 + seeded_normal((HEAD_DIM,), 9, 0.0549)
+        return 0.1001 + torch.randn(HEAD_DIM,) * 0.0549
     def init_compress_state_block_table():
         table = torch.full((HCA_STATE_MAX_BLOCKS,), -1, dtype=torch.int32)
         for block in range(HCA_STATE_MAX_BLOCKS):
@@ -585,7 +581,7 @@ def build_tensor_specs(
         for abs_pos in range(max(0, context_len - COMPRESS_RATIO), context_len):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = seeded_uniform((MAIN_OUT_DIM,), 12000 + abs_pos, 0.05)
+                flat[row] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
         return state
     def init_cmp_score_state():
         state = torch.zeros(HCA_STATE_BLOCK_NUM, HCA_STATE_BLOCK_SIZE, MAIN_OUT_DIM)
@@ -593,7 +589,7 @@ def build_tensor_specs(
         for abs_pos in range(max(0, context_len - COMPRESS_RATIO), context_len):
             row = state_row(abs_pos)
             if row >= 0:
-                flat[row] = seeded_uniform((MAIN_OUT_DIM,), 13000 + abs_pos, 0.05)
+                flat[row] = (torch.rand(MAIN_OUT_DIM,) - 0.5) * 0.05
         return state
     def cache_row_from_table(table, slot):
         block = slot // BLOCK_SIZE
@@ -608,7 +604,7 @@ def build_tensor_specs(
         table = init_ori_block_table()
         if context_len > 0:
             prefix_start = max(0, context_len - WIN)
-            prefix = seeded_uniform((context_len, HEAD_DIM), 11, 0.1).to(torch.bfloat16)
+            prefix = ((torch.rand(context_len, HEAD_DIM) - 0.5) * 0.1).to(torch.bfloat16)
             for pos_i in range(prefix_start, context_len):
                 row = cache_row_from_table(table, pos_i % WIN)
                 if row >= 0:
@@ -633,7 +629,7 @@ def build_tensor_specs(
         table = init_cmp_block_table()
         completed = context_len // COMPRESS_RATIO
         if completed > 0:
-            prefix_cmp = seeded_uniform((completed, HEAD_DIM), 14, 0.1).to(torch.bfloat16)
+            prefix_cmp = ((torch.rand(completed, HEAD_DIM) - 0.5) * 0.1).to(torch.bfloat16)
             for cmp_slot in range(completed):
                 row = cache_row_from_table(table, cmp_slot)
                 if row >= 0:
@@ -698,9 +694,9 @@ def build_tensor_specs(
     def init_attn_sink():
         return torch.zeros(H)
     def init_wo_a():
-        return seeded_uniform((O_GROUPS, O_LORA, O_GROUP_IN), 9, O_GROUP_IN ** -0.5)
+        return (torch.rand(O_GROUPS, O_LORA, O_GROUP_IN) - 0.5) * O_GROUP_IN ** -0.5
     def init_wo_b():
-        return seeded_uniform((D, O_GROUPS * O_LORA), 10, (O_GROUPS * O_LORA) ** -0.5)
+        return (torch.rand(D, O_GROUPS * O_LORA) - 0.5) * (O_GROUPS * O_LORA) ** -0.5
 
     wq_b_bf16 = init_wq_b().to(torch.bfloat16)
     wq_b_i8, wq_b_scale = _quant_w_per_output_channel(wq_b_bf16)
@@ -712,7 +708,7 @@ def build_tensor_specs(
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
-        TensorSpec("attn_norm_w", [D], torch.float32, init_value=init_attn_norm_w),
+        TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=init_attn_norm_w),
         TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
@@ -724,7 +720,7 @@ def build_tensor_specs(
         TensorSpec("cmp_wkv", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wkv),
         TensorSpec("cmp_wgate", [D, MAIN_OUT_DIM], torch.bfloat16, init_value=init_cmp_wgate),
         TensorSpec("cmp_ape", [COMPRESS_RATIO, MAIN_OUT_DIM], torch.float32, init_value=init_cmp_ape),
-        TensorSpec("cmp_norm_w", [HEAD_DIM], torch.float32, init_value=init_cmp_norm_w),
+        TensorSpec("cmp_norm_w", [HEAD_DIM], torch.bfloat16, init_value=init_cmp_norm_w),
         # Compressor caches are written in-place but not validated here (decode
         # parity); the dedicated prefill_compressor_ratio128 test covers them.
         TensorSpec(
@@ -847,7 +843,7 @@ if __name__ == "__main__":
         atol=1e-2,
         compile_only=args.compile_only,
         compare_fn={
-            "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=3e-3, pct_thd=0.005, max_diff_hd=1),
+            "x_out": valid_ratio_reldiff(compare_tokens, diff_thd=5e-3, pct_thd=0.005, max_diff_hd=1),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
         },
     )

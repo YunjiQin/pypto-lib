@@ -101,7 +101,7 @@ def decode_layer(
     hc_attn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -128,7 +128,7 @@ def decode_layer(
     hca_cmp_wkv: pl.Tensor[[D, HCA_MAIN_OUT_DIM], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[D, HCA_MAIN_OUT_DIM], pl.BF16],
     hca_cmp_ape: pl.Tensor[[HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
-    hca_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    hca_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     hca_compress_state: pl.Tensor[
         [HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM],
         pl.FP32,
@@ -137,7 +137,7 @@ def decode_layer(
     csa_cmp_wkv: pl.Tensor[[D, CSA_MAIN_OUT_DIM], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[D, CSA_MAIN_OUT_DIM], pl.BF16],
     csa_cmp_ape: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
-    csa_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.FP32],
+    csa_cmp_norm_w: pl.Tensor[[HEAD_DIM], pl.BF16],
     csa_compress_state: pl.Tensor[[CSA_MAIN_STATE_BLOCK_NUM, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM], pl.FP32],
     csa_compress_state_block_table: pl.Tensor[[B, CSA_MAIN_STATE_MAX_BLOCKS], pl.INT32],
     csa_idx_wq_b: pl.Tensor[[Q_LORA, CSA_IDX_N_HEADS * CSA_IDX_HEAD_DIM], pl.INT8],
@@ -147,7 +147,7 @@ def decode_layer(
     csa_inner_wkv: pl.Tensor[[D, CSA_INNER_OUT_DIM], pl.BF16],
     csa_inner_wgate: pl.Tensor[[D, CSA_INNER_OUT_DIM], pl.BF16],
     csa_inner_ape: pl.Tensor[[CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
-    csa_inner_norm_w: pl.Tensor[[CSA_IDX_HEAD_DIM], pl.FP32],
+    csa_inner_norm_w: pl.Tensor[[CSA_IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.Tensor[
         [CSA_INNER_STATE_BLOCK_NUM, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM],
         pl.FP32,
@@ -160,7 +160,7 @@ def decode_layer(
     hc_ffn_fn: pl.Tensor[[MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[3], pl.FP32],
     hc_ffn_base: pl.Tensor[[MIX_HC], pl.FP32],
-    norm_w: pl.Tensor[[D], pl.FP32],
+    norm_w: pl.Tensor[[D], pl.BF16],
     gate_w: pl.Tensor[[N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[VOCAB, TOPK], pl.INT32],
@@ -261,7 +261,7 @@ def l3_decode_layer(
     hc_attn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_attn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_attn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
-    attn_norm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
+    attn_norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     wq_a: pl.Tensor[[N_RANKS, D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[N_RANKS, Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[N_RANKS, H * HEAD_DIM], pl.FP32],
@@ -288,7 +288,7 @@ def l3_decode_layer(
     hca_cmp_wkv: pl.Tensor[[N_RANKS, D, HCA_MAIN_OUT_DIM], pl.BF16],
     hca_cmp_wgate: pl.Tensor[[N_RANKS, D, HCA_MAIN_OUT_DIM], pl.BF16],
     hca_cmp_ape: pl.Tensor[[N_RANKS, HCA_COMPRESS_RATIO, HCA_MAIN_OUT_DIM], pl.FP32],
-    hca_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.FP32],
+    hca_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     hca_compress_state: pl.Tensor[
         [N_RANKS, HCA_COMPRESS_STATE_BLOCK_NUM, HCA_COMPRESS_STATE_BLOCK_SIZE, HCA_COMPRESS_STATE_DIM],
         pl.FP32,
@@ -297,7 +297,7 @@ def l3_decode_layer(
     csa_cmp_wkv: pl.Tensor[[N_RANKS, D, CSA_MAIN_OUT_DIM], pl.BF16],
     csa_cmp_wgate: pl.Tensor[[N_RANKS, D, CSA_MAIN_OUT_DIM], pl.BF16],
     csa_cmp_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, CSA_MAIN_OUT_DIM], pl.FP32],
-    csa_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.FP32],
+    csa_cmp_norm_w: pl.Tensor[[N_RANKS, HEAD_DIM], pl.BF16],
     csa_compress_state: pl.Tensor[
         [N_RANKS, CSA_MAIN_STATE_BLOCK_NUM, CSA_MAIN_STATE_BLOCK_SIZE, CSA_MAIN_STATE_DIM],
         pl.FP32,
@@ -310,7 +310,7 @@ def l3_decode_layer(
     csa_inner_wkv: pl.Tensor[[N_RANKS, D, CSA_INNER_OUT_DIM], pl.BF16],
     csa_inner_wgate: pl.Tensor[[N_RANKS, D, CSA_INNER_OUT_DIM], pl.BF16],
     csa_inner_ape: pl.Tensor[[N_RANKS, CSA_COMPRESS_RATIO, CSA_INNER_OUT_DIM], pl.FP32],
-    csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_IDX_HEAD_DIM], pl.FP32],
+    csa_inner_norm_w: pl.Tensor[[N_RANKS, CSA_IDX_HEAD_DIM], pl.BF16],
     csa_inner_compress_state: pl.Tensor[
         [N_RANKS, CSA_INNER_STATE_BLOCK_NUM, CSA_INNER_STATE_BLOCK_SIZE, CSA_INNER_STATE_DIM],
         pl.FP32,
@@ -323,7 +323,7 @@ def l3_decode_layer(
     hc_ffn_fn: pl.Tensor[[N_RANKS, MIX_HC, HC_DIM], pl.FP32],
     hc_ffn_scale: pl.Tensor[[N_RANKS, 3], pl.FP32],
     hc_ffn_base: pl.Tensor[[N_RANKS, MIX_HC], pl.FP32],
-    norm_w: pl.Tensor[[N_RANKS, D], pl.FP32],
+    norm_w: pl.Tensor[[N_RANKS, D], pl.BF16],
     gate_w: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL, D], pl.FP32],
     gate_bias: pl.Tensor[[N_RANKS, N_EXPERTS_GLOBAL], pl.FP32],
     tid2eid: pl.Tensor[[N_RANKS, VOCAB, TOPK], pl.INT32],
@@ -830,11 +830,10 @@ if __name__ == "__main__":
         rtol=1e-3,
         atol=1e-3,
         compare_fn={
+            # Real-weight x_next over-thd fractions (frac>5e-3 / frac>1e-2):
+            # swa(L0) 0.4% / 0.003%, hca(L9) 1.9% / 1.0%, csa(L8) 3.8% / 0.6%.
+            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.05),
             "kv_cache": ratio_allclose(atol=1e-4, rtol=1.0 / 128),
-            # KV strict, x_next on an FFN envelope (one gate for all layer_id branches).
-            # Strict per-point bar: over-1e-2 fraction is swa ~6.1% / hca ~6.2% / csa ~8.1%
-            # (csa binding), so pct_thd=0.10. Alt: diff_thd=0.03, pct_thd=0.05 (all <=1.4%).
-            "x_next": ratio_reldiff(diff_thd=0.01, pct_thd=0.1),
         },
     )
     if not result.passed:

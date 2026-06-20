@@ -67,7 +67,7 @@ def attention_swa(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     # qkv_proj_rope weights
-    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -224,7 +224,7 @@ def attention_swa_test(
     hc_attn_scale: pl.Tensor[[3], pl.FP32],
     hc_attn_base: pl.Tensor[[MIX_HC], pl.FP32],
     # qkv_proj_rope weights
-    attn_norm_w: pl.Tensor[[D], pl.FP32],
+    attn_norm_w: pl.Tensor[[D], pl.BF16],
     wq_a: pl.Tensor[[D, Q_LORA], pl.BF16],
     wq_b: pl.Tensor[[Q_LORA, H * HEAD_DIM], pl.INT8],
     wq_b_scale: pl.Tensor[[H * HEAD_DIM], pl.FP32],
@@ -419,7 +419,7 @@ def build_tensor_specs(start_pos=None):
         return w_i8, (1.0 / scale_quant).float()
 
     def init_x_hc():
-        return torch.randn(T, HC_MULT, D) * 0.05
+        return torch.empty(T, HC_MULT, D).uniform_(-1, 1)
     # Real layer-0 (SWA) hc_attn scale/base (fn synthetic at real magnitude). A synthetic
     # scale=0.5/base=0 leaves hc_pre post~=1 + near-uniform comb, cancelling attn_out and the
     # hc residual to near-zero in x_out where quant noise blows up the relative tail.
@@ -509,7 +509,7 @@ def build_tensor_specs(start_pos=None):
         TensorSpec("hc_attn_fn", [MIX_HC, HC_DIM], torch.float32, init_value=init_hc_attn_fn),
         TensorSpec("hc_attn_scale", [3], torch.float32, init_value=init_hc_attn_scale),
         TensorSpec("hc_attn_base", [MIX_HC], torch.float32, init_value=init_hc_attn_base),
-        TensorSpec("attn_norm_w", [D], torch.float32, init_value=init_attn_norm_w),
+        TensorSpec("attn_norm_w", [D], torch.bfloat16, init_value=init_attn_norm_w),
         TensorSpec("wq_a", [D, Q_LORA], torch.bfloat16, init_value=init_wq_a),
         TensorSpec("wq_b", [Q_LORA, H * HEAD_DIM], torch.int8, init_value=lambda: wq_b_i8),
         TensorSpec("wq_b_scale", [H * HEAD_DIM], torch.float32, init_value=lambda: wq_b_scale),
