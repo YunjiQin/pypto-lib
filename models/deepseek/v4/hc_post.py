@@ -46,11 +46,11 @@ def hc_post(
         token_block = block // HC_MULT
         out_h = block % HC_MULT
         t0 = token_block * T_TILE
-        for t in pl.pipeline(t0, t0 + T_TILE, stage=4):
+        for t in pl.pipeline(t0, t0 + T_TILE, stage=2):
             post_w = pl.read(post, [t, out_h])
             x_row = pl.cast(x[t : t + 1, 0:D], target_type=pl.FP32)
             y_row = pl.mul(x_row, post_w)
-            for in_h in pl.range(HC_MULT):
+            for in_h in pl.pipeline(HC_MULT, stage=4):
                 comb_w = pl.read(comb, [t, in_h * HC_MULT + out_h])
                 res_d = in_h * D
                 res_row = pl.cast(residual_flat[t : t + 1, res_d : res_d + D], target_type=pl.FP32)

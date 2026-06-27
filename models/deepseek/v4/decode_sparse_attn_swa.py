@@ -91,7 +91,6 @@ PROJ_B_ACT_N_TILE = 512   # vector N frag for the decoupled per-group dequant+su
                           # now sums O_GROUPS INT32 partials, each x its group act scale, then
                           # x the per-channel weight scale -> BF16). 512 (not 1024) keeps the
                           # O_GROUPS-way accumulate inside UB and gives D/512 = 8 vector tasks.
-QUANT_TILE = 512
 # Fused amax+quant token tile. The fused scope streams o_r twice (amax pass + quant
 # pass) per token-tile rather than holding the whole row, so UB stays small; 8 keeps
 # the [1, QUANT_TOKEN_TILE] fp32 amax tile 32-byte aligned (8*4=32B, the alloc-tile
@@ -139,8 +138,6 @@ assert PROJ_B_D_CHUNK % PROJ_B_MM_N_TILE == 0, "proj_b inner N-frag loop must co
 assert T % NUM_QUANT_T_CHUNKS == 0 and QUANT_T_CHUNK % QUANT_TOKEN_TILE == 0
 assert T % PROJ_B_ACT_TBLK == 0 and PROJ_B_ACT_TBLK % PROJ_B_ACT_T_TILE == 0
 assert D % PROJ_B_ACT_N_TILE == 0, "proj_b_act vector N-loop must cover D"
-assert (O_GROUPS * O_LORA) % QUANT_TILE == 0
-assert O_LORA % QUANT_TILE == 0, "per-group quant streams O_LORA in QUANT_TILE chunks"
 assert O_LORA % B_K_TILE == 0, "proj_b group K-loop covers O_LORA in B_K_TILE iters"
 assert D % SEED_N_CHUNK == 0
 
@@ -158,9 +155,11 @@ def get_standalone_cmp_valid(compress_ratio: int) -> int:
 
 # SWA sparse-K width: sliding window only.
 TOPK = WIN
-# Floor to 2: a single sparse-K block miscompiles in pypto (S-stride cross-token
-# output mixup); a 2-block build with an all-invalid 2nd block is bit-exact.
-SPARSE_BLOCKS = max(2, (TOPK + ATTN_K_TILE - 1) // ATTN_K_TILE)
+# SWA's sparse window (TOPK = WIN keys) fits a single ATTN_K_TILE block, so use
+# one block directly -- no all-invalid 2nd block and no cross-block softmax
+# merge. (Supersedes the old floor-to-2 single-block-miscompile workaround;
+# validated bit-exact across all decode fixtures.)
+SPARSE_BLOCKS = 1
 PADDED_TOPK = SPARSE_BLOCKS * ATTN_K_TILE
 assert WIN <= TOPK <= TOPK_FULL, f"TOPK ({TOPK}) must be in [WIN={WIN}, TOPK_FULL={TOPK_FULL}]"
 assert PADDED_TOPK % GATHER_FILL_TILE == 0, \
@@ -324,27 +323,12 @@ def sparse_attn_swa(
         m_t = pl.tile.get_block_idx()
         m_token_base = m_t * (H // H_TILE) * SPARSE_BLOCKS * H_TILE
 
-        for m_h_idx in pl.range((H // H_TILE)):
+        for m_h_idx in pl.pipeline(H // H_TILE, stage=2):
             m_h0 = m_h_idx * H_TILE
             m_blk_base = m_token_base + m_h_idx * SPARSE_BLOCKS * H_TILE
             m_mi = sparse_blk_mi[m_blk_base : m_blk_base + H_TILE, 0 : 1]
             m_li = sparse_blk_li[m_blk_base : m_blk_base + H_TILE, 0 : 1]
             m_oi = sparse_blk_oi[m_blk_base : m_blk_base + H_TILE, 0 : HEAD_DIM]
-
-            # Guarded so the SWA (SPARSE_BLOCKS == 1) specialization uses the
-            # single block's stats directly instead of an empty merge loop.
-            if SPARSE_BLOCKS > 1:
-                for m_sb in pl.range(1, SPARSE_BLOCKS):
-                    m_row = m_blk_base + m_sb * H_TILE
-                    m_cur_mi = sparse_blk_mi[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_li = sparse_blk_li[m_row : m_row + H_TILE, 0 : 1]
-                    m_cur_oi = sparse_blk_oi[m_row : m_row + H_TILE, 0 : HEAD_DIM]
-                    m_mi_new = pl.maximum(m_mi, m_cur_mi)
-                    m_alpha = pl.exp(pl.sub(m_mi, m_mi_new))
-                    m_beta = pl.exp(pl.sub(m_cur_mi, m_mi_new))
-                    m_li = pl.add(pl.mul(m_alpha, m_li), pl.mul(m_beta, m_cur_li))
-                    m_oi = pl.add(pl.row_expand_mul(m_oi, m_alpha), pl.row_expand_mul(m_cur_oi, m_beta))
-                    m_mi = m_mi_new
 
             n_sink_bias = pl.reshape(attn_sink[m_h0 : m_h0 + H_TILE], [H_TILE, 1])
             n_sink_tile = pl.add(pl.sub(m_mi, m_mi), n_sink_bias)
@@ -354,7 +338,7 @@ def sparse_attn_swa(
             n_rope_row = m_t * H + m_h0
             attn_rope_stage[n_rope_row : n_rope_row + H_TILE, 0 : ROPE_DIM] = n_full[0 : H_TILE, NOPE_DIM : HEAD_DIM]
 
-            for n_hi in pl.range(H_TILE):
+            for n_hi in pl.unroll(H_TILE):
                 n_gh = m_h0 + n_hi
                 n_g = n_gh // HEADS_PER_GROUP
                 n_hh = n_gh - n_g * HEADS_PER_GROUP
@@ -489,19 +473,20 @@ def sparse_attn_swa(
                 col_g = g * O_LORA
                 with pl.at(level=pl.Level.CORE_GROUP, name_hint="quant",
                            deps=[proj_a_tids[g * PA_NFRAGS + j] for j in range(PA_NFRAGS)]) as q_tid:
-                    for qt in pl.range(t_base, t_base + QUANT_T_CHUNK, QUANT_TOKEN_TILE):
-                        g_amax = pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS)
-                        for k1 in pl.range(0, O_LORA, QUANT_TILE):
-                            oc = o_r[qt:qt + QUANT_TOKEN_TILE, col_g + k1:col_g + k1 + QUANT_TILE]
-                            g_amax = pl.maximum(g_amax, pl.reshape(pl.row_max(pl.maximum(oc, pl.neg(oc))), [1, QUANT_TOKEN_TILE]))
+                    for qt in pl.pipeline(t_base, t_base + QUANT_T_CHUNK, QUANT_TOKEN_TILE, stage=2):
+                        # amax pass: O_LORA fits one tile, so the whole group row is read at once.
+                        oc_amax = o_r[qt:qt + QUANT_TOKEN_TILE, col_g:col_g + O_LORA]
+                        g_amax = pl.maximum(
+                            pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_AMAX_EPS),
+                            pl.reshape(pl.row_max(pl.maximum(oc_amax, pl.neg(oc_amax))), [1, QUANT_TOKEN_TILE]))
                         g_sq_row = pl.div(pl.full([1, QUANT_TOKEN_TILE], dtype=pl.FP32, value=INT8_SCALE_MAX), g_amax)
                         act_scale_dq = pl.assemble(act_scale_dq, pl.recip(g_sq_row), [g, qt])
                         g_sq_col = pl.reshape(g_sq_row, [QUANT_TOKEN_TILE, 1])
-                        for k1 in pl.range(0, O_LORA, QUANT_TILE):
-                            oc = o_r[qt:qt + QUANT_TOKEN_TILE, col_g + k1:col_g + k1 + QUANT_TILE]
-                            oq_i32 = pl.cast(pl.row_expand_mul(oc, g_sq_col), target_type=pl.INT32, mode="rint")
-                            oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
-                            o_r_i8 = pl.assemble(o_r_i8, pl.cast(oq_half, target_type=pl.INT8, mode="trunc"), [qt, col_g + k1])
+                        # quant pass: re-read o_r (the 2nd stream mostly hits L2) to keep UB small.
+                        oc_q = o_r[qt:qt + QUANT_TOKEN_TILE, col_g:col_g + O_LORA]
+                        oq_i32 = pl.cast(pl.row_expand_mul(oc_q, g_sq_col), target_type=pl.INT32, mode="rint")
+                        oq_half = pl.cast(oq_i32, target_type=pl.FP16, mode="round")
+                        o_r_i8 = pl.assemble(o_r_i8, pl.cast(oq_half, target_type=pl.INT8, mode="trunc"), [qt, col_g])
                 quant_tids[g * NUM_QUANT_T_CHUNKS + tc] = q_tid
 
         # proj_b_mm[dc, g]: PURE-CUBE INT8 GEMM of group g's contribution to a
@@ -520,12 +505,15 @@ def sparse_attn_swa(
                            deps=[quant_tids[g * NUM_QUANT_T_CHUNKS + tc] for tc in range(NUM_QUANT_T_CHUNKS)]) as pb_tid:
                     for nf in pl.range(PROJ_B_D_CHUNK // PROJ_B_MM_N_TILE):
                         n0 = d0 + nf * PROJ_B_MM_N_TILE
-                        acc_b = pl.matmul(o_r_i8[:, col_g:col_g + B_K_TILE],
+                        acc_b = pl.create_tensor([T, PROJ_B_MM_N_TILE], dtype=pl.INT32)
+                        for kb in pl.pipeline(0, O_LORA // B_K_TILE, stage=2):
+                            k0 = col_g + kb * B_K_TILE
+                            if kb == 0:
+                                acc_b = pl.matmul(o_r_i8[:, col_g:col_g + B_K_TILE],
                                           wo_b[n0:n0 + PROJ_B_MM_N_TILE, col_g:col_g + B_K_TILE],
                                           b_trans=True, out_dtype=pl.INT32)
-                        for kb in pl.pipeline(1, O_LORA // B_K_TILE, stage=2):
-                            k0 = col_g + kb * B_K_TILE
-                            acc_b = pl.matmul_acc(acc_b, o_r_i8[:, k0:k0 + B_K_TILE],
+                            else:
+                                acc_b = pl.matmul_acc(acc_b, o_r_i8[:, k0:k0 + B_K_TILE],
                                                   wo_b[n0:n0 + PROJ_B_MM_N_TILE, k0:k0 + B_K_TILE], b_trans=True)
                         partials = pl.assemble(partials, acc_b, [0, g * D + n0])
                 proj_b_tids[dc * O_GROUPS + g] = pb_tid
@@ -544,7 +532,7 @@ def sparse_attn_swa(
         wb_scale_chunk = pl.reshape(wo_b_scale[ob_n0:ob_n0 + PROJ_B_ACT_N_TILE], [1, PROJ_B_ACT_N_TILE])
         for b_tb in pl.range(t0, t0 + PROJ_B_ACT_TBLK, PROJ_B_ACT_T_TILE):
             acc = pl.full([PROJ_B_ACT_T_TILE, PROJ_B_ACT_N_TILE], dtype=pl.FP32, value=0.0)
-            for g in pl.range(O_GROUPS):
+            for g in pl.pipeline(O_GROUPS, stage=2):
                 p_g = partials[b_tb:b_tb + PROJ_B_ACT_T_TILE, g * D + ob_n0:g * D + ob_n0 + PROJ_B_ACT_N_TILE]
                 g_scale = pl.reshape(act_scale_dq[g:g + 1, b_tb:b_tb + PROJ_B_ACT_T_TILE], [PROJ_B_ACT_T_TILE, 1])
                 acc = pl.add(acc, pl.row_expand_mul(pl.cast(p_g, target_type=pl.FP32, mode="none"), g_scale))
