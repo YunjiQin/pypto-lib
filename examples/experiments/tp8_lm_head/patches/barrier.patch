@@ -1,0 +1,13 @@
+--- a/lm_head.py
++++ b/lm_head.py
+@@ -159,7 +159,9 @@
+         # Selected hidden rows in GM.
+         selected_hidden = pl.create_tensor([MAX_LOGIT_ROWS, D], dtype=pl.BF16)
+
+-        with pl.spmd(64, name_hint="lm_head_select_rows") as _select_tid:
++        with pl.at(level=pl.Level.CORE_GROUP, name_hint="tp8_start_barrier", allow_early_resolve=False) as start_ready:
++            logits_done = pld.tensor.barrier(logits_done)
++        with pl.spmd(64, name_hint="lm_head_select_rows", deps=[start_ready]) as _select_tid:
+             block = pl.tile.get_block_idx()
+             hidden_rows = pl.tensor.dim(hidden_states, 0)
+             for row in pl.range(block, MAX_LOGIT_ROWS, 64):

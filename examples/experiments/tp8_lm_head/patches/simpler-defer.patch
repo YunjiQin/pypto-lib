@@ -1,0 +1,154 @@
+--- a/kernels/aiv/lm_head_dispatch_push_urma.cpp
++++ b/kernels/aiv/lm_head_dispatch_push_urma.cpp
+@@ -35,29 +35,7 @@
+ using namespace pto;
+
+
+-// --- URMA async transfer adapter ---
+-// V1 completion is owned by the enclosing task: the helpers below only submit
+-// the request and register its completion condition. They never poll or wait,
+-// and returning does not mean the transfer has completed.
+-//
+-// ABI: pypto codegen emits
+-//   func.call @pypto_urma_{put,get}_async_<dtype>(
+-//       raw_args, comm_ctx, dst_base, src_base,
+-//       dst_byte_offset, src_byte_offset, nbytes, peer,
+-//       dst_extent, src_extent)
+-// The C++ definitions below use the same argument order. The local endpoint may
+-// be a plain tensor; the remote address is resolved through the peer MR.
+-// ``dst_extent``/``src_extent`` are each endpoint tensor view's byte span
+-// (including any stride gaps). The window check alone cannot bound a dynamic
+-// subregion to the tensor that owns it: the window holds every registered
+-// buffer, so a runtime offset past one tensor but inside the window would
+-// otherwise overwrite a neighbour. Static subregions are already bounded by
+-// the IR verifier; these extents carry the same bound to runtime.
+-static __aicore__ void pypto_urma_fail(AsyncCtx& ctx, int32_t code) {
+-  pto2::detail::set_urma_error(ctx, code);
+-  pto2::detail::defer_flush(ctx);
+-}
+-
++// Fixed TP8 benchmark; compiler-side dynamic validation is omitted here.
+ template <typename T, bool kPut>
+ static __aicore__ void pypto_urma_transfer_impl(
+     __gm__ int64_t* raw_args,
+@@ -71,76 +49,16 @@
+     int64_t dst_extent,
+     int64_t src_extent)
+ {
+-  if (raw_args == nullptr) {
+-#if defined(__CPU_SIM)
+-    __builtin_trap();
+-#else
+-    trap();
+-#endif
+-    return;
+-  }
+-
+   AsyncCtx ctx = get_async_ctx(raw_args);
+-
+-  if (comm_ctx_raw == nullptr || dst_base == nullptr || src_base == nullptr ||
+-      dst_off < 0 || src_off < 0 || nbytes <= 0 ||
+-      dst_extent <= 0 || src_extent <= 0 ||
+-      nbytes % static_cast<int64_t>(sizeof(T)) != 0) {
+-    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+-    return;
+-  }
+-
+-  __gm__ CommContext* comm = reinterpret_cast<__gm__ CommContext*>(comm_ctx_raw);
+-  const uint64_t workspace_addr =
+-      comm_workspace<CommWorkspaceKind::URMA>(*comm).addr;
+-  if (workspace_addr == 0 || peer < 0 ||
+-      static_cast<uint64_t>(peer) >= static_cast<uint64_t>(comm->rankNum) ||
+-      static_cast<uint64_t>(peer) == static_cast<uint64_t>(comm->rankId) ||
+-      comm->windowsIn[comm->rankId] == 0) {
+-    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+-    return;
+-  }
+-
+-  auto* workspace = reinterpret_cast<__gm__ uint8_t*>(workspace_addr);
+-  const int64_t elems = static_cast<int64_t>(nbytes) / static_cast<int64_t>(sizeof(T));
+-  // Address arithmetic stays in integers until every range is validated: a
+-  // typed pointer formed past the end of an allocation is already undefined
+-  // behavior, even if the next line would reject it. Bounds are checked with
+-  // subtraction, not by adding nbytes, so an offset near the top of the
+-  // address space cannot wrap the sum. The tensor extent is measured from the
+-  // endpoint view's base, so the view-relative offset is the one to compare;
+-  // `remote_off` is measured from the window base and is only for the window
+-  // check and peer address.
+-  constexpr uint64_t kMaxAddress = ~static_cast<uint64_t>(0);
+-  const uint64_t bytes = static_cast<uint64_t>(nbytes);
+-  const uint64_t local_off = static_cast<uint64_t>(kPut ? src_off : dst_off);
+-  const uint64_t local_extent = static_cast<uint64_t>(kPut ? src_extent : dst_extent);
+-  const uint64_t remote_view_off = static_cast<uint64_t>(kPut ? dst_off : src_off);
+-  const uint64_t remote_extent = static_cast<uint64_t>(kPut ? dst_extent : src_extent);
+-  const uint64_t local_base_abs =
+-      reinterpret_cast<uint64_t>(kPut ? src_base : dst_base);
+-  const uint64_t remote_base_abs =
+-      reinterpret_cast<uint64_t>(kPut ? dst_base : src_base);
+-  const uint64_t local_window = comm->windowsIn[comm->rankId];
+-  // The local endpoint may be outside the remote endpoint's communication window.
+-  if (local_off > local_extent || bytes > local_extent - local_off ||
+-      remote_view_off > remote_extent || bytes > remote_extent - remote_view_off ||
+-      local_off > kMaxAddress - local_base_abs ||
+-      remote_view_off > kMaxAddress - remote_base_abs) {
+-    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+-    return;
+-  }
+-  const uint64_t local_abs = local_base_abs + local_off;
+-  const uint64_t remote_abs = remote_base_abs + remote_view_off;
+-  if (remote_abs < local_window) {
+-    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+-    return;
+-  }
+-  const uint64_t remote_off = remote_abs - local_window;
+-  if (remote_off > comm->winSize || bytes > comm->winSize - remote_off) {
+-    pypto_urma_fail(ctx, static_cast<int32_t>(SIMPLER_ERROR_ASYNC_COMPLETION_INVALID));
+-    return;
+-  }
++  auto* comm = reinterpret_cast<__gm__ CommContext*>(comm_ctx_raw);
++  auto* workspace = reinterpret_cast<__gm__ uint8_t*>(
++      comm_workspace<CommWorkspaceKind::URMA>(*comm).addr);
++  const int64_t elems = nbytes / static_cast<int64_t>(sizeof(T));
++  const uint64_t local_abs = reinterpret_cast<uint64_t>(kPut ? src_base : dst_base)
++                             + static_cast<uint64_t>(kPut ? src_off : dst_off);
++  const uint64_t remote_off = reinterpret_cast<uint64_t>(kPut ? dst_base : src_base)
++                              + static_cast<uint64_t>(kPut ? dst_off : src_off)
++                              - comm->windowsIn[comm->rankId];
+   __gm__ T* local = reinterpret_cast<__gm__ T*>(local_abs);
+   __gm__ T* remote = pto2::urma_backend::peer_mr_ptr<T>(
+       workspace, static_cast<uint32_t>(peer), remote_off);
+@@ -158,18 +76,12 @@
+   // populated from a local store before the cross-rank handshake. In both
+   // directions the preceding local stores must be visible before submission.
+   pipe_barrier(PIPE_ALL);
+-  const bool submitted =
+-      kPut ? send_request_entry(
++  (void)(kPut ? send_request_entry(
+                  ctx, UrmaTput(dst_tensor, src_tensor, workspace,
+                                static_cast<uint32_t>(peer)))
+            : send_request_entry(
+                  ctx, UrmaTget(dst_tensor, src_tensor, workspace,
+-                               static_cast<uint32_t>(peer)));
+-  if (!submitted) {
+-    // The submission path already published the failing chunk's error code;
+-    // flush the registered conditions so the scheduler observes them.
+-    pto2::detail::defer_flush(ctx);
+-  }
++                               static_cast<uint32_t>(peer))));
+ }
+
+ extern "C" {
+@@ -285,11 +197,11 @@
+     int64_t v36 = v35 < v17 ? (int64_t) ((uint64_t) v35 + (uint64_t) v16) : v35;
+     // pto: %10
+     ;
+-    int64_t v37 = v33 < v17 ? v17 : v33;
++    int64_t v37 = v33;
+     int64_t v38 = (int64_t) ((uint64_t) v37 * (uint64_t) v9);
+     // pto: %17, %19, %20, %21, %23, %24, %52
+     ;
+-    int64_t v39 = v33 >= v17 & (v33 <= v11 & (int64_t) ((uint64_t) v11 - (uint64_t) v33) >= v14) ? v19 : v10;
++    int64_t v39 = v19;
+     // pto: %53, %54
+     ;
+     int64_t v40 = (int64_t) ((uint64_t) ((int64_t) v4) + (uint64_t) v36);

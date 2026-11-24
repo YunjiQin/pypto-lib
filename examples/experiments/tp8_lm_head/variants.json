@@ -1,0 +1,57 @@
+{
+  "mte-original": {
+    "model_edits": [],
+    "chip_edits": []
+  },
+  "mte-pipeline": {
+    "model_edits": [],
+    "chip_edits": [
+      "mte-pipeline"
+    ]
+  },
+  "urma-checked": {
+    "model_edits": [
+      "urma"
+    ],
+    "chip_edits": []
+  },
+  "direct-wqe": {
+    "model_edits": [
+      "urma"
+    ],
+    "chip_edits": [
+      "direct-wqe"
+    ]
+  },
+  "isa-wait": {
+    "model_edits": [
+      "urma"
+    ],
+    "chip_edits": [
+      "isa-wait"
+    ]
+  },
+  "isa-submit": {
+    "model_edits": [
+      "urma"
+    ],
+    "chip_edits": [
+      "isa-wait",
+      "isa-submit"
+    ]
+  },
+  "simpler-defer": {
+    "model_edits": [
+      "urma"
+    ],
+    "chip_edits": [
+      "simpler-defer"
+    ]
+  },
+  "ccu": {
+    "model_edits": [
+      "ccu"
+    ],
+    "chip_edits": []
+  }
+}

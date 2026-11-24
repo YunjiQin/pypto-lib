@@ -1,0 +1,31 @@
+--- a/lm_head.py
++++ b/lm_head.py
+@@ -171,15 +171,21 @@
+                 if source_raw >= 0:
+                     selected = hidden_states[source:source + 1, :]
+                 selected_hidden[row:row + 1, :] = selected
+-        with pl.spmd(64, name_hint="lm_head_dispatch_push", deps=[_select_tid]) as _dispatch_push_tid:
++        # The first seven blocks each post one contiguous URMA write to a different peer.
++        # The remaining blocks each copy one original three-row MTE tile to the local slot.
++        with pl.spmd(LM_HEAD_TP_SIZE - 1 + MAX_LOGIT_ROWS // HIDDEN_PUSH_ROW_TILE, name_hint="lm_head_dispatch_push_urma", deps=[_select_tid]) as _dispatch_push_tid:
+             worker = pl.tile.get_block_idx()
+-            row_tiles = MAX_LOGIT_ROWS // HIDDEN_PUSH_ROW_TILE
+-            for tile in pl.range(worker, LM_HEAD_TP_SIZE * row_tiles, 64):
+-                peer = (tp_rank + tile // row_tiles) % LM_HEAD_TP_SIZE
+-                row = tile % row_tiles * HIDDEN_PUSH_ROW_TILE
+-                destination = tp_rank * MAX_LOGIT_ROWS + row
++            destination = tp_rank * MAX_LOGIT_ROWS
++            if worker < LM_HEAD_TP_SIZE - 1:
++                peer = (tp_rank + 1 + worker) % LM_HEAD_TP_SIZE
++                pld.tensor.put_async(
++                    hidden_window, peer=group_base + peer, src=selected_hidden, dst_offsets=[destination, 0],
++                    src_offsets=[0, 0], shape=[MAX_LOGIT_ROWS, D], engine=pld.CommEngine.URMA,
++                )
++            else:
++                row = (worker - (LM_HEAD_TP_SIZE - 1)) * HIDDEN_PUSH_ROW_TILE
+                 pld.tensor.put(
+-                    hidden_window, peer=group_base + peer, src=selected_hidden, dst_offsets=[destination, 0],
++                    hidden_window, peer=group_base + tp_rank, src=selected_hidden, dst_offsets=[destination + row, 0],
+                     src_offsets=[row, 0], shape=[HIDDEN_PUSH_ROW_TILE, D],
+                 )
+         with pl.spmd(LM_HEAD_TP_SIZE, name_hint="lm_head_dispatch_notify", deps=[_dispatch_push_tid]) as _dispatch_notify_tid:
