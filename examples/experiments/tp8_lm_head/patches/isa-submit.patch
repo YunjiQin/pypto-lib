@@ -77,7 +77,7 @@
 +  if (drained != 1) trap();
 +}
 +
-+static __aicore__ void lm_head_dispatch_notify_after_urma(__gm__ int32_t* v1, int32_t v2, int32_t v3, __gm__ int64_t* v4, int32_t v5, int32_t v6) {
++static __aicore__ void lm_head_dispatch_notify_after_urma(__gm__ int32_t* v1, int32_t v2, int32_t v3, __gm__ int64_t* v4, int32_t v5, int32_t v6, __gm__ int64_t* payload_ctx) {
    using T = float;
 
    #if defined(__DAV_VEC__)
@@ -85,11 +85,11 @@
    int64_t v14 = (int64_t) v2;
    // pto: %1
    if (v13 != v14) {
-+    drain_hidden_write(v4, static_cast<uint32_t>(v3 + v13));
++    drain_hidden_write(payload_ctx, static_cast<uint32_t>(v3 + v13));
      // pto: %2, %3
      ;
      int64_t v15 = (int64_t) ((uint64_t) ((int64_t) v3) + (uint64_t) v13);
-@@ -167,17 +202,17 @@
+@@ -167,17 +202,18 @@
 
      // Unpack scalar: tp_rank__ssa_v0
      union { uint64_t u64; int32_t val; } tp_rank__ssa_v0_conv;
@@ -110,7 +110,8 @@
      // Forward to ptoas-generated function
 -    lm_head_combine_notify(logits_done__ssa_v1, tp_rank__ssa_v0, group_base__ssa_v0, logits_done_ctx, __pypto_spmd_block_idx, __pypto_spmd_block_num);
 -}
-+    lm_head_dispatch_notify_after_urma(logits_done__ssa_v1, tp_rank__ssa_v0, group_base__ssa_v0, logits_done_ctx, __pypto_spmd_block_idx, __pypto_spmd_block_num);
++    lm_head_dispatch_notify_after_urma(logits_done__ssa_v1, tp_rank__ssa_v0, group_base__ssa_v0, logits_done_ctx, __pypto_spmd_block_idx, __pypto_spmd_block_num,
++        reinterpret_cast<__gm__ int64_t*>(args[5]));
 +}
 --- a/kernel_config.py
 +++ b/kernel_config.py
@@ -120,7 +121,7 @@
  ]
 --- a/orchestration/l2_lm_head.cpp
 +++ b/orchestration/l2_lm_head.cpp
-@@ -94,6 +94,7 @@
+@@ -94,15 +94,17 @@
          // Spmd lm_head_dispatch_notify_spmd: lm_head_combine_notify
          CoreTaskArgs params_t3;
          params_t3.add_inout(ext_hidden_done);
@@ -128,7 +129,9 @@
          params_t3.add_scalar(tp_rank);
          params_t3.add_scalar(group_base);
          params_t3.add_scalar(hidden_done_ctx);
-@@ -102,7 +103,7 @@
++        params_t3.add_scalar(hidden_window_ctx);  // Drain the payload domain before notifying through MTE.
+         params_t3.launch_spec.set_block_num(8);
+         TaskId params_t3_deps[1];
          uint32_t params_t3_deps_count = 0;
          params_t3_deps[params_t3_deps_count++] = _dispatch_push_tid_inline166;
          params_t3.set_dependencies(params_t3_deps, params_t3_deps_count);

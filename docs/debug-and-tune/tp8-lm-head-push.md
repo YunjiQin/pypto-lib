@@ -14,20 +14,26 @@ domain. The reference machine used driver 25.6.rc3.1. Start in this
 pypto-lib checkout with its Python dependencies and CANN environment active.
 The base pypto-lib commit is `461f1a6154f77afa346818596731bade5f7988be`.
 
-Prepare the matching PyPTO source and submodules before building or installing
-the toolchain. These are the revisions the generated-source patches target.
+The compiler uses the PyPTO integration snapshot. The runtime uses a fixed
+commit from Simpler main, recorded in [simpler.pin](../../examples/experiments/tp8_lm_head/simpler.pin).
+From the pypto-lib root, select that runtime after initializing the PyPTO
+submodules and before building or installing either package.
 
 ```bash
 git clone --branch integration/urma-ccu-test https://github.com/hw-native-sys/pypto.git ../pypto-tp8
 git -C ../pypto-tp8 checkout --detach 864c8b86b2bae5c53b951d880b6794c5887cb0d2
 git -C ../pypto-tp8 submodule update --init --recursive
 export PYPTO_ROOT="$(cd ../pypto-tp8 && pwd)"
-git -C "$PYPTO_ROOT/runtime" rev-parse HEAD
+simpler_pin=$(cat examples/experiments/tp8_lm_head/simpler.pin)
+git -C "$PYPTO_ROOT/runtime" fetch origin "$simpler_pin"
+git -C "$PYPTO_ROOT/runtime" checkout --detach "$simpler_pin"
 cat "$PYPTO_ROOT/runtime/pto_isa.pin"
 ```
 
-Simpler should be `390beebce6a8a3079e075a2e99315670eae4cff1` and PTO-ISA
-`8fb67fa7e5e02ae942b708c59f65d7b8380ae526`. Install PyPTO and Simpler for the
+This Simpler revision pins PTO-ISA `45435c0624c1d0d056bf38aa60d4f56dc0ef3b6b`.
+PyPTO can warn that its original `runtime/` gitlink differs from the working
+tree. The runtime checkout and the installed native binding must both match
+the experiment pin; the runner checks the binding before compiling or capturing. Install PyPTO and Simpler for the
 `a5` target using the [installation guide](../get-started/installation.md).
 An existing built checkout at these revisions works too: use its Python
 environment, or add its `python`, `runtime` and `runtime/python` directories to
@@ -78,19 +84,22 @@ tasks. Times use rank-local clocks and exclude the separate notify/wait tasks.
 
 | CLI variant | Remote push implementation | Median rank max | Max across 8 cards | Median worker span | Median scheduler latency |
 |---|---|---:|---:|---:|---:|
-| `mte-original` | 64 AIV blocks, synchronous MTE row tiles | 28.50 | 31.22 | 33.47 | 56.31 |
-| `mte-pipeline` | One block per peer, two 32 KiB MTE staging buffers | 21.39 | 22.78 | 21.96 | 24.10 |
-| `urma-checked` | Original PyPTO checks and Simpler submit/defer | 13.59 | 17.05 | 13.80 | 46.35 |
-| `direct-wqe` | Fixed shape, one WRITE WQE per peer, manually register the Simpler deferred event | 6.61 | 6.93 | 6.99 | 43.85 |
-| `isa-wait` | ISA session and TPUT, wait for the event in the sending block | 32.40 | 33.28 | 32.71 | 36.17 |
-| `isa-submit` | ISA session and TPUT, return after submission | 9.48 | 10.14 | 9.68 | — |
-| `simpler-defer` | Remove PyPTO checks, retain Simpler submission, validation and deferred completion | 12.55 | 13.73 | 12.76 | 45.91 |
-| `ccu` | CCU allgather submitted by one AIV wrapper | 8.03 | 9.04 | 8.03 | 124.25 |
+| `mte-original` | 64 AIV blocks, synchronous MTE row tiles | 27.97 | 31.11 | 33.48 | 52.54 |
+| `mte-pipeline` | One block per peer, two 32 KiB MTE staging buffers | 21.10 | 21.88 | 21.64 | 25.39 |
+| `urma-checked` | Original PyPTO checks and Simpler submit/defer | 14.26 | 17.57 | 14.39 | 45.87 |
+| `direct-wqe` | Fixed shape, one WRITE WQE per peer, manually register the Simpler deferred event | 6.67 | 6.92 | 6.92 | 47.11 |
+| `isa-wait` | ISA session and TPUT, wait for the event in the sending block | 33.26 | 34.77 | 33.54 | 37.97 |
+| `isa-submit` | ISA session and TPUT, return after submission | 9.40 | 10.10 | 9.64 | — |
+| `simpler-defer` | Remove PyPTO checks, retain Simpler submission, validation and deferred completion | 11.32 | 12.22 | 11.76 | 45.97 |
+| `ccu` | CCU allgather submitted by one AIV wrapper | 7.89 | 8.53 | 7.89 | 126.94 |
 
-The two MTE rows are from a paired allocation. The URMA and CCU rows are
-earlier captures of the same workload. Per-peer variants use seven remote
-push blocks and 24 local three-row copies. In `isa-submit` the dependent
-hidden-state notifier drains the posted queue before signaling the peer.
+All eight variants run in one allocation. Per-peer variants use seven remote
+push blocks and 24 local three-row copies. In the five URMA variants, the
+registered hidden payload has its own URMA domain; the MTE start barrier,
+signals and logits exchange share a peer-mapped device domain. Simpler main
+leaves peer VA mappings out of URMA domains. In `isa-submit` the dependent
+hidden-state notifier drains the posted queue using the payload context,
+then signals the peer using the MTE context.
 Its push bar measures submission only, so the scheduler transfer-completion
 column is empty. The CCU wrapper bar also measures submission. The
 `direct-wqe` patch assumes this fixture's single outstanding WRITE per queue
@@ -116,5 +125,6 @@ fails the reproduction.
 
 The [runner](../../examples/experiments/tp8_lm_head/reproduce.py) selects edits via the
 [variant manifest](../../examples/experiments/tp8_lm_head/variants.json).
-Model patches reproduce the original DAG and barrier. Native patches are
-applied to freshly generated chip sources before assembly and replay.
+Model patches reproduce the original DAG and barrier. The URMA host edit
+separates payload and signal domains. Native patches are applied to freshly
+generated chip sources before assembly and replay.

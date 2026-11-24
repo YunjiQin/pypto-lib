@@ -43,6 +43,19 @@ BASELINE_OUTPUT = {
 }
 
 
+def verify_runtime_pin():
+    from pypto.runtime.runtime_pin import runtime_pin_status
+
+    expected = (HERE / "simpler.pin").read_text().strip()
+    installed = runtime_pin_status().installed
+    if installed != expected:
+        raise RuntimeError(
+            f"Expected Simpler {expected}, loaded {installed}. "
+            "Build and select the runtime checkout specified in simpler.pin."
+        )
+    print(f"Simpler native binding: {installed}", flush=True)
+
+
 def digest(tensor):
     data = tensor.detach().cpu().contiguous().view(torch.uint8).numpy()
     return hashlib.sha256(memoryview(data).cast("B")).hexdigest()
@@ -134,6 +147,8 @@ def prepare(path, variant):
     if not result.passed:
         raise RuntimeError(result.error)
     artifact = Path(result.work_dir).resolve()
+    if "urma" in model_edits:
+        apply_edit(artifact / "orchestration", "urma-domains")
     (chip,) = (artifact / "next_levels").glob("*/kernel_config.py")
     for name in native_edits:
         if name == "isa-submit":
@@ -201,6 +216,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", default="0,1,2,3,4,5,6,7")
     a = parser.parse_args()
     out = a.out.resolve()
+    if a.stage in ("prepare", "capture"):
+        verify_runtime_pin()
     if a.stage == "fixture":
         fixture_directory(out, a.fixture)
     elif a.stage == "prepare":

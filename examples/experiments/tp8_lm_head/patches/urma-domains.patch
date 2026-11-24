@@ -1,0 +1,51 @@
+--- a/host_orch.py
++++ b/host_orch.py
+@@ -7,18 +7,25 @@
+     tensors["__comm_d0_ord"] = [torch.zeros((1,), dtype=torch.int32).share_memory_() for _ in range(max(world_size, 1))]
+
+ def l3_lm_head(orch, _args, config, *, tensors, callables, sub_ids, _keep, world_size, _domain_provider=None, _window_sources=None):
+-    with (_domain_provider or orch.allocate_domain)(
++    # URMA registers the hidden payload by MR. The barrier, notifications and
++    # logits exchange need a separate MTE domain with peer VA mappings.
++    allocate = _domain_provider or orch.allocate_domain
++    with allocate(
+         name="comm_d0",
+         workers=[*range(world_size)],
+-        window_size=((((5898240 + 63) // 64) * 64)) + ((((18616320 + 63) // 64) * 64)) + ((((32 + 63) // 64) * 64)) + ((((32 + 63) // 64) * 64)),
+-        workspace_engines=("urma",),
++        window_size=18616320 + 64 + 64,
+         buffers=[
+-            CommBufferSpec(name="hidden_window_buf__ssa_v0", dtype="opaque", count=5898240, nbytes=(((5898240 + 63) // 64) * 64)),
+             CommBufferSpec(name="logits_window_buf__ssa_v0", dtype="opaque", count=18616320, nbytes=(((18616320 + 63) // 64) * 64)),
+             CommBufferSpec(name="hidden_done_buf__ssa_v0", dtype="opaque", count=32, nbytes=(((32 + 63) // 64) * 64)),
+             CommBufferSpec(name="logits_done_buf__ssa_v0", dtype="opaque", count=32, nbytes=(((32 + 63) // 64) * 64)),
+         ],
+-    ) as __comm_d0:
++    ) as __comm_d0, allocate(
++        name="hidden_urma",
++        workers=[*range(world_size)],
++        window_size=5898240,
++        workspace_engines=("urma",),
++        buffers=[CommBufferSpec(name="hidden_window_buf__ssa_v0", dtype="opaque", count=5898240, nbytes=(((5898240 + 63) // 64) * 64))],
++    ) as hidden_urma:
+         t__tmp_v0 = world_size
+         for r__idx_v0 in range(0, t__tmp_v0, 1):
+             tensors["t__tmp_v1"] = tensors["hidden_states__ssa_v0"][r__idx_v0, 0:72, 0:5120]
+@@ -32,7 +39,7 @@
+             add_chip_tensor_arg(_ta_0, orch._worker, tensors["t__tmp_v3"], TensorArgType.INPUT, callables, "l2_lm_head", 2)
+             add_chip_tensor_arg(_ta_0, orch._worker, tensors["t__tmp_v4"], TensorArgType.OUTPUT_EXISTING, callables, "l2_lm_head", 3)
+             add_chip_tensor_arg(_ta_0, orch._worker, tensors["t__tmp_v5"], TensorArgType.OUTPUT_EXISTING, callables, "l2_lm_head", 4)
+-            _ta_0.add_tensor(__comm_d0[r__idx_v0].buffers["hidden_window_buf__ssa_v0"].tensor(shapes=(576, 5120), dtype=DataType.BFLOAT16), TensorArgType.INOUT)
++            _ta_0.add_tensor(hidden_urma[r__idx_v0].buffers["hidden_window_buf__ssa_v0"].tensor(shapes=(576, 5120), dtype=DataType.BFLOAT16), TensorArgType.INOUT)
+             _ta_0.add_tensor(__comm_d0[r__idx_v0].buffers["hidden_done_buf__ssa_v0"].tensor(shapes=(8, 1), dtype=DataType.INT32), TensorArgType.INOUT)
+             _ta_0.add_tensor(__comm_d0[r__idx_v0].buffers["logits_window_buf__ssa_v0"].tensor(shapes=(72, 129280), dtype=DataType.BFLOAT16), TensorArgType.INPUT)
+             _ta_0.add_tensor(__comm_d0[r__idx_v0].buffers["logits_done_buf__ssa_v0"].tensor(shapes=(8, 1), dtype=DataType.INT32), TensorArgType.INOUT)
+@@ -41,7 +48,7 @@
+             _ta_0.add_scalar((r__idx_v0 % 8))
+             _ta_0.add_scalar(1)
+             _ta_0.add_scalar(1)
+-            _ta_0.add_scalar(__comm_d0[r__idx_v0].device_ctx)
++            _ta_0.add_scalar(hidden_urma[r__idx_v0].device_ctx)
+             _ta_0.add_scalar(__comm_d0[r__idx_v0].device_ctx)
+             _ta_0.add_scalar(__comm_d0[r__idx_v0].device_ctx)
+             _ta_0.add_scalar(__comm_d0[r__idx_v0].device_ctx)
